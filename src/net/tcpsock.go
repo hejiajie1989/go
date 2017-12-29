@@ -328,6 +328,7 @@ func ListenTCP(network string, laddr *TCPAddr) (*TCPListener, error) {
 	if laddr == nil {
 		laddr = &TCPAddr{}
 	}
+	//开始端口listen
 	ln, err := listenTCP(context.Background(), network, laddr)
 	if err != nil {
 		return nil, &OpError{Op: "listen", Net: network, Source: nil, Addr: laddr.opAddr(), Err: err}

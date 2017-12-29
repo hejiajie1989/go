@@ -350,6 +350,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn
 			ctx = subCtx
 		}
 	}
+	//现在Cancel使用WithCancel返回的
 	if oldCancel := d.Cancel; oldCancel != nil {
 		subCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -385,6 +386,8 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn
 
 	var primaries, fallbacks addrList
 	if d.DualStack && network == "tcp" {
+		//如果解析出来的地址中同时存在IPV6和IPV4的地址的话, 若DualStack为true即同时允许不同协议的进行connect
+		// primaries至少会保存第一个地址，如果addrList里面有其它同类型的则都会保存在primaries中，其余的都保存在fallbacks里
 		primaries, fallbacks = addrs.partition(isIPv4)
 	} else {
 		primaries = addrs
@@ -392,6 +395,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn
 
 	var c Conn
 	if len(fallbacks) > 0 {
+		//同时连接IPV4和非IPV4的
 		c, err = dialParallel(ctx, dp, primaries, fallbacks)
 	} else {
 		c, err = dialSerial(ctx, dp, primaries)
@@ -491,12 +495,15 @@ func dialSerial(ctx context.Context, dp *dialParam, ras addrList) (Conn, error) 
 
 	for i, ra := range ras {
 		select {
+		//检查Context是否cancel
 		case <-ctx.Done():
 			return nil, &OpError{Op: "dial", Net: dp.network, Source: dp.LocalAddr, Addr: ra, Err: mapErr(ctx.Err())}
 		default:
 		}
 
 		deadline, _ := ctx.Deadline()
+		//这里会将timeout时间和addrlist的连接数进行计算，每个地址都会占用相同的时间，比如1min 一共四个addrs
+		//那么每个addr的timeout时间其实只有15s
 		partialDeadline, err := partialDeadline(time.Now(), deadline, len(ras)-i)
 		if err != nil {
 			// Ran out of time.
@@ -506,12 +513,14 @@ func dialSerial(ctx context.Context, dp *dialParam, ras addrList) (Conn, error) 
 			break
 		}
 		dialCtx := ctx
+		//如果partialDealine比deadline还早的话，那么就需要使用partialDeadline产生的context
 		if partialDeadline.Before(deadline) {
 			var cancel context.CancelFunc
 			dialCtx, cancel = context.WithDeadline(ctx, partialDeadline)
 			defer cancel()
 		}
 
+		//这里才是真正的做连接
 		c, err := dialSingle(dialCtx, dp, ra)
 		if err == nil {
 			return c, nil
@@ -529,7 +538,9 @@ func dialSerial(ctx context.Context, dp *dialParam, ras addrList) (Conn, error) 
 
 // dialSingle attempts to establish and returns a single connection to
 // the destination address.
+//创建连接返回一个`Conn`的结构体
 func dialSingle(ctx context.Context, dp *dialParam, ra Addr) (c Conn, err error) {
+	//nettrace.Trace可以跟踪net包里面的一些activity，比如下面connectStart和connectDone
 	trace, _ := ctx.Value(nettrace.TraceKey{}).(*nettrace.Trace)
 	if trace != nil {
 		raStr := ra.String()
@@ -544,6 +555,8 @@ func dialSingle(ctx context.Context, dp *dialParam, ra Addr) (c Conn, err error)
 	switch ra := ra.(type) {
 	case *TCPAddr:
 		la, _ := la.(*TCPAddr)
+		//开始连接TCP
+		//TODO 这里为什么ra也是*TCPAddr类型的??
 		c, err = dialTCP(ctx, dp.network, la, ra)
 	case *UDPAddr:
 		la, _ := la.(*UDPAddr)

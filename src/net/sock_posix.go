@@ -39,6 +39,7 @@ type sockaddr interface {
 // socket returns a network file descriptor that is ready for
 // asynchronous I/O using the network poller.
 func socket(ctx context.Context, net string, family, sotype, proto int, ipv6only bool, laddr, raddr sockaddr) (fd *netFD, err error) {
+	//通过调用系统调用返回一个fd
 	s, err := sysSocket(family, sotype, proto)
 	if err != nil {
 		return nil, err
@@ -47,6 +48,7 @@ func socket(ctx context.Context, net string, family, sotype, proto int, ipv6only
 		poll.CloseFunc(s)
 		return nil, err
 	}
+	//新建*netFD
 	if fd, err = newFD(s, family, sotype, net); err != nil {
 		poll.CloseFunc(s)
 		return nil, err
@@ -75,6 +77,7 @@ func socket(ctx context.Context, net string, family, sotype, proto int, ipv6only
 	// the other connection holders.
 
 	if laddr != nil && raddr == nil {
+		//表示该端口做listening
 		switch sotype {
 		case syscall.SOCK_STREAM, syscall.SOCK_SEQPACKET:
 			if err := fd.listenStream(laddr, listenerBacklog); err != nil {

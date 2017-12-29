@@ -59,6 +59,7 @@ func dialTCP(ctx context.Context, net string, laddr, raddr *TCPAddr) (*TCPConn, 
 }
 
 func doDialTCP(ctx context.Context, net string, laddr, raddr *TCPAddr) (*TCPConn, error) {
+	//在internetSocket内部完成 新建fd，初始化netFD，已经真正的connect
 	fd, err := internetSocket(ctx, net, laddr, raddr, syscall.SOCK_STREAM, 0, "dial")
 
 	// TCP has a rarely used mechanism called a 'simultaneous connection' in
@@ -95,6 +96,7 @@ func doDialTCP(ctx context.Context, net string, laddr, raddr *TCPAddr) (*TCPConn
 	if err != nil {
 		return nil, err
 	}
+	//新建TCPConn结构体
 	return newTCPConn(fd), nil
 }
 
