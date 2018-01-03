@@ -592,6 +592,9 @@ func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitF
 	}
 
 	// Flush and wait for 100-continue if expected.
+	//如果client有"Expected: 100-continue" 那么就直接先把POST请求发出去征求server的意见
+	//通常server会返回100，那么就需要立刻发送POST请求的数据
+	//不过有时候server可能没很好的实现100-continue协议，那么我们就需要在timeout无响应时间后立刻上传POST数据
 	if waitForContinue != nil {
 		if bw, ok := w.(*bufio.Writer); ok {
 			err = bw.Flush()
@@ -776,6 +779,7 @@ func NewRequest(method, url string, body io.Reader) (*Request, error) {
 	if err != nil {
 		return nil, err
 	}
+	//这里传入的body仅仅是一个Reader而没有Closer的话那么会创建一个ReadCloser，只是Close返回的是nil
 	rc, ok := body.(io.ReadCloser)
 	if !ok && body != nil {
 		rc = ioutil.NopCloser(body)

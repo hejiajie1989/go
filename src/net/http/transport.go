@@ -57,6 +57,10 @@ const DefaultMaxIdleConnsPerHost = 2
 // Transport is an implementation of RoundTripper that supports HTTP,
 // HTTPS, and HTTP proxies (for either HTTP or HTTPS with CONNECT).
 //
+
+// Transport会缓存connection以便将来复用，但是这就会导致会有很多的idle connections。
+// 不过Transport 提供了CloseIdleConnections方法来关闭多余的idle connections
+
 // By default, Transport caches connections for future re-use.
 // This may leave many open connections when accessing many hosts.
 // This behavior can be managed using Transport's CloseIdleConnections method
@@ -338,6 +342,8 @@ func (tr *transportRequest) setError(err error) {
 //
 // For higher-level HTTP client support (such as handling of cookies
 // and redirects), see Get, Post, and the Client type.
+// client.Do(*Request) 最后执行HTTP事务是走到这里
+// 具体可以参考RoundTripper接口里面的方法说明
 func (t *Transport) RoundTrip(req *Request) (*Response, error) {
 	t.nextProtoOnce.Do(t.onceSetNextProtoDefaults)
 	ctx := req.Context()
@@ -347,6 +353,8 @@ func (t *Transport) RoundTrip(req *Request) (*Response, error) {
 		req.closeBody()
 		return nil, errors.New("http: nil Request.URL")
 	}
+	//有些HTTP请求可能header是nil，但是之前的操作会保证到transport这里的header不为nil
+	// 具体可见client.go的send()
 	if req.Header == nil {
 		req.closeBody()
 		return nil, errors.New("http: nil Request.Header")
@@ -354,6 +362,7 @@ func (t *Transport) RoundTrip(req *Request) (*Response, error) {
 	scheme := req.URL.Scheme
 	isHTTP := scheme == "http" || scheme == "https"
 	if isHTTP {
+		//如果是HTTP请求
 		for k, vv := range req.Header {
 			if !httplex.ValidHeaderFieldName(k) {
 				return nil, fmt.Errorf("net/http: invalid header field name %q", k)
@@ -367,6 +376,8 @@ func (t *Transport) RoundTrip(req *Request) (*Response, error) {
 	}
 
 	altProto, _ := t.altProto.Load().(map[string]RoundTripper)
+	//altProto是保存所有协议对应的RoundTrip的，但是我grep了下貌似就只有https和file、foo的
+	//如果是http协议的 这里应该没有
 	if altRT := altProto[scheme]; altRT != nil {
 		if resp, err := altRT.RoundTrip(req); err != ErrSkipAltProtocol {
 			return resp, err
@@ -386,6 +397,7 @@ func (t *Transport) RoundTrip(req *Request) (*Response, error) {
 
 	for {
 		// treq gets modified by roundTrip, so we need to recreate for each retry.
+		//transportRequest重新封装Request
 		treq := &transportRequest{Request: req, trace: trace}
 		cm, err := t.connectMethodForRequest(treq)
 		if err != nil {
@@ -397,6 +409,7 @@ func (t *Transport) RoundTrip(req *Request) (*Response, error) {
 		// host (for http or https), the http proxy, or the http proxy
 		// pre-CONNECTed to https server. In any case, we'll be ready
 		// to send it requests.
+		// 获取一个TCP connection来写request
 		pconn, err := t.getConn(treq, cm)
 		if err != nil {
 			t.setReqCanceler(req, nil)
@@ -410,6 +423,7 @@ func (t *Transport) RoundTrip(req *Request) (*Response, error) {
 			t.setReqCanceler(req, nil) // not cancelable with CancelRequest
 			resp, err = pconn.alt.RoundTrip(req)
 		} else {
+			//通常情况下，比如HTTP/1.1之类的都会走到这儿
 			resp, err = pconn.roundTrip(treq)
 		}
 		if err == nil {
@@ -778,6 +792,7 @@ func (t *Transport) getIdleConn(cm connectMethod) (pconn *persistConn, idleSince
 	defer t.idleMu.Unlock()
 	for {
 		pconns, ok := t.idleConn[key]
+		// pconns是一个slice
 		if !ok {
 			return nil, time.Time{}
 		}
@@ -904,6 +919,7 @@ func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (*persistC
 	if trace != nil && trace.GetConn != nil {
 		trace.GetConn(cm.addr())
 	}
+	//获取一个idle connection以及idle时长
 	if pc, idleSince := t.getIdleConn(cm); pc != nil {
 		if trace != nil && trace.GotConn != nil {
 			trace.GotConn(pc.gotIdleConnTrace(idleSince))
@@ -915,6 +931,7 @@ func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (*persistC
 		return pc, nil
 	}
 
+	//那如果没有获取到idle connection 我们就需要create connection
 	type dialRes struct {
 		pc  *persistConn
 		err error
@@ -937,6 +954,7 @@ func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (*persistC
 	}
 
 	cancelc := make(chan error, 1)
+	//这个就是设置request的取消函数，如果该Req被cancel了，那么就执行后面的func
 	t.setReqCanceler(req, func(err error) { cancelc <- err })
 
 	go func() {
@@ -946,6 +964,7 @@ func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (*persistC
 
 	idleConnCh := t.getIdleConnCh(cm)
 	select {
+	//如果是这个case 那么就说明我们之前做的dialConn已经完成，创建了一个新的persistConnection
 	case v := <-dialc:
 		// Our dial finished.
 		if v.pc != nil {
@@ -973,6 +992,9 @@ func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (*persistC
 			// return the original error message:
 			return nil, v.err
 		}
+	//如果是这种case的话那么则说明是有别的request好了，调用tryPutIdleConn将persistConn返还了
+	// 但是我们之前创建新的connection的动作还在继续，那么这里就开了一个goroutine如果拿到新的创建的connection并且没有error，
+	// 那么我们就将新建的connection调用tryPutIdleConn放回去下次使用
 	case pc := <-idleConnCh:
 		// Another request finished first and its net.Conn
 		// became available before our dial. Or somebody
@@ -984,6 +1006,7 @@ func (t *Transport) getConn(treq *transportRequest, cm connectMethod) (*persistC
 			trace.GotConn(httptrace.GotConnInfo{Conn: pc.conn, Reused: pc.isReused()})
 		}
 		return pc, nil
+	//下面这几种都是req被cancel掉 需要指定收尾工作
 	case <-req.Cancel:
 		handlePendingDial()
 		return nil, errRequestCanceledConn
@@ -1079,6 +1102,7 @@ func (pconn *persistConn) addTLS(name string, trace *httptrace.ClientTrace) erro
 	return nil
 }
 
+//创建一个persistConn
 func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (*persistConn, error) {
 	pconn := &persistConn{
 		t:             t,
@@ -1126,6 +1150,7 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (*persistCon
 			pconn.tlsState = &cs
 		}
 	} else {
+		//通过net.dial创建
 		conn, err := t.dial(ctx, "tcp", cm.addr())
 		if err != nil {
 			return nil, wrapErr(err)
@@ -1750,10 +1775,12 @@ func (pc *persistConn) readResponse(rc requestAndChan, trace *httptrace.ClientTr
 			trace.GotFirstResponseByte()
 		}
 	}
+	//这边就是读取Response
 	resp, err = ReadResponse(pc.br, rc.req)
 	if err != nil {
 		return
 	}
+	//如果是101
 	if rc.continueCh != nil {
 		if resp.StatusCode == 100 {
 			if trace != nil && trace.Got100Continue != nil {
@@ -1802,6 +1829,7 @@ type nothingWrittenError struct {
 	error
 }
 
+//每个persisteConn连接都有一个writeLoop和readLoop的goroutine来做真正的读写操作
 func (pc *persistConn) writeLoop() {
 	defer close(pc.writeLoopDone)
 	for {
@@ -1935,6 +1963,7 @@ var (
 	testHookReadLoopBeforeNextRead             = nop
 )
 
+//这里就是通过persistConn进行一次HTTP交互并且返回Response
 func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
 	testHookEnterRoundTrip()
 	if !pc.t.replaceReqCanceler(req.Request, pc.cancelRequest) {
@@ -1954,6 +1983,7 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 	// own value for Accept-Encoding. We only attempt to
 	// uncompress the gzip stream if we were the layer that
 	// requested it.
+	// 默认是使用gzip编码
 	requestedGzip := false
 	if !pc.t.DisableCompression &&
 		req.Header.Get("Accept-Encoding") == "" &&
@@ -2000,9 +2030,11 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 	// request body.
 	startBytesWritten := pc.nwrite
 	writeErrCh := make(chan error, 1)
+	//writeRequest是发给writeLoop, writeLoop会一直读writech这个channel
 	pc.writech <- writeRequest{req, writeErrCh, continueCh}
 
 	resc := make(chan responseAndError)
+	//而requestAndChan这个是写到reqch的，readLoop一直读reqch这个channel
 	pc.reqch <- requestAndChan{
 		req:        req.Request,
 		ch:         resc,
@@ -2017,6 +2049,7 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 	for {
 		testHookWaitResLoop()
 		select {
+		//这个是writeLoop goroutine写的
 		case err := <-writeErrCh:
 			if debugRoundTrip {
 				req.logf("writeErrCh resv: %T/%#v", err, err)

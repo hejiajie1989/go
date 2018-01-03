@@ -214,6 +214,7 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, d
 		return nil, alwaysFalse, errors.New("http: nil Request.URL")
 	}
 
+	//在http client的request中这个filed不设置，而使用URL field
 	if req.RequestURI != "" {
 		req.closeBody()
 		return nil, alwaysFalse, errors.New("http: Request.RequestURI can't be set in client requests.")
@@ -221,6 +222,8 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, d
 
 	// forkReq forks req into a shallow clone of ireq the first
 	// time it's called.
+	//如果req和ireq指向相同的Request结构体，那么就为req新建内存空间并进行浅拷贝，
+	//对于发送的req来说可能需要修改Header等信息，如果确定需要修改的话则确保不会更改到ireq的内容
 	forkReq := func() {
 		if ireq == req {
 			req = new(Request)
@@ -244,11 +247,18 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, d
 		req.Header.Set("Authorization", "Basic "+basicAuth(username, password))
 	}
 
+	//IsZero()检验dealine是否显示初始化，也就是判断是否是Time零值January 1, year 1, 00:00:00.000000000 UTC
 	if !deadline.IsZero() {
 		forkReq()
 	}
+	//以下真正执行发送请求的其实是req 而不是参数传进来的ireq
 	stopTimer, didTimeout := setRequestCancel(req, rt, deadline)
 
+	// RoundTripper是一个interface，而Transport实现了这个接口，因此这里调用的是Transport.RoundTrip()方法
+	// Transport会获取一个connection，初始化一个persistConn，每个persistConn都有一个writeLoop和readLoop，
+	// writeLoop负责写buffer并且调用Flush()刷新缓冲，真正send data。
+	//另外特别处理了对于"Expected: 100-continue",
+	//RoundTrip, writeLoop 还有readLoop之间通过channel相互通讯，包括timeout error等
 	resp, err = rt.RoundTrip(req)
 	if err != nil {
 		stopTimer()
@@ -321,12 +331,19 @@ func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTi
 
 	go func() {
 		select {
+		//initialReqCancel是req原先的Cancel，如果原先的Request被cancel了，那么我们就需要在这边将request
+		//cancel掉并且停止timer
+		//TODO 为什么这里需要使用initialReqCancel保存初始的req.Cancel
+		//然后再为req make一个新的channel，如果通过原先的Cancel做request
+		//cancel的话，那么理论上这个req和ireq都应该会被cancel掉的啊??
 		case <-initialReqCancel:
 			doCancel()
 			timer.Stop()
+		//如果timeout
 		case <-timer.C:
 			timedOut.setTrue()
 			doCancel()
+		//如果close stopTimerCh
 		case <-stopTimerCh:
 			timer.Stop()
 		}
@@ -497,7 +514,8 @@ func (c *Client) Do(req *Request) (*Response, error) {
 	}
 
 	var (
-		deadline      = c.deadline()
+		deadline = c.deadline()
+		//这个是当存在Redirect的时候 将每一次的request都保存起来
 		reqs          []*Request
 		resp          *Response
 		copyHeaders   = c.makeHeadersCopier(req)
@@ -528,6 +546,8 @@ func (c *Client) Do(req *Request) (*Response, error) {
 	for {
 		// For all but the first request, create the next
 		// request hop and replace req.
+		//初始情况下req长度为0，此时还没有请求过的req
+		//做这里都是因为ShouldRedirect的
 		if len(reqs) > 0 {
 			loc := resp.Header.Get("Location")
 			if loc == "" {
@@ -614,6 +634,7 @@ func (c *Client) Do(req *Request) (*Response, error) {
 		var didTimeout func() bool
 		if resp, didTimeout, err = c.send(req, deadline); err != nil {
 			// c.send() always closes req.Body
+			// 这句话我的理解是 只有err!=nil的时候才会总是close req.Body
 			reqBodyClosed = true
 			if !deadline.IsZero() && didTimeout() {
 				err = &httpError{
@@ -630,6 +651,9 @@ func (c *Client) Do(req *Request) (*Response, error) {
 			return resp, nil
 		}
 
+		//因为需要shoudRedirect，所有需要把之前的req.Body
+		//close掉，然手重新执行请求，之后会在for循环的开头读取上次resp的内容然后close resp.Body
+		// 但是当成功的时候 最后一次req的Body谁来关闭
 		req.closeBody()
 	}
 }
